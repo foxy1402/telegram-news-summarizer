@@ -8,7 +8,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -36,7 +36,8 @@ def env_required(name: str) -> str:
 class Settings:
     api_id: int
     api_hash: str
-    bot_token: str
+    user_session_string: str
+    sender_bot_token: str
     target_chat_id: int
     channel_usernames: List[str]
     openai_base_url: str
@@ -62,7 +63,8 @@ class Settings:
         return Settings(
             api_id=int(env_required("TELEGRAM_API_ID")),
             api_hash=env_required("TELEGRAM_API_HASH"),
-            bot_token=env_required("TELEGRAM_BOT_TOKEN"),
+            user_session_string=env_required("TELEGRAM_USER_SESSION_STRING"),
+            sender_bot_token=env_required("TELEGRAM_BOT_TOKEN"),
             target_chat_id=int(env_required("TARGET_CHAT_ID")),
             channel_usernames=channel_usernames,
             openai_base_url=env_required("OPENAI_BASE_URL").rstrip("/"),
@@ -72,7 +74,7 @@ class Settings:
             summary_max_items=int(os.getenv("SUMMARY_MAX_ITEMS", "80")),
             summary_max_chars_per_item=int(os.getenv("SUMMARY_MAX_CHARS_PER_ITEM", "700")),
             summary_send_time_utc=os.getenv("SUMMARY_SEND_TIME_UTC", "00:10"),
-            retention_days=int(os.getenv("RETENTION_DAYS", "7")),
+            retention_days=int(os.getenv("RETENTION_DAYS", "1")),
             data_dir=data_dir,
         )
 
@@ -271,11 +273,18 @@ class Summarizer:
 class NewsBot:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.client = Client(
-            name=str(settings.data_dir / "pyrogram_session"),
+        self.ingest_client = Client(
+            name=str(settings.data_dir / "user_ingest"),
             api_id=settings.api_id,
             api_hash=settings.api_hash,
-            bot_token=settings.bot_token,
+            session_string=settings.user_session_string,
+            workdir=str(settings.data_dir),
+        )
+        self.sender_client = Client(
+            name=str(settings.data_dir / "bot_sender"),
+            api_id=settings.api_id,
+            api_hash=settings.api_hash,
+            bot_token=settings.sender_bot_token,
             workdir=str(settings.data_dir),
         )
         self.storage = NewsStorage(settings.data_dir / "news.sqlite3")
@@ -287,16 +296,14 @@ class NewsBot:
         for username in self.settings.channel_usernames:
             ch = username if username.startswith("@") else f"@{username}"
             try:
-                chat = await self.client.get_chat(ch)
+                chat = await self.ingest_client.get_chat(ch)
                 self._channel_chat_ids.add(chat.id)
                 logging.info("Tracking channel %s (id=%s)", ch, chat.id)
             except Exception:
-                logging.exception("Failed to access channel %s. Ensure bot is added.", ch)
+                logging.exception("Failed to access channel %s via user session", ch)
 
     def _is_tracked(self, msg: Message) -> bool:
-        if not msg.chat:
-            return False
-        return msg.chat.id in self._channel_chat_ids
+        return bool(msg.chat and msg.chat.id in self._channel_chat_ids)
 
     async def backfill_recent(self, days: int = 1, per_channel_limit: int = 500) -> None:
         since = datetime.now(timezone.utc) - timedelta(days=days)
@@ -304,7 +311,7 @@ class NewsBot:
             ch = username if username.startswith("@") else f"@{username}"
             count = 0
             try:
-                async for msg in self.client.get_chat_history(ch, limit=per_channel_limit):
+                async for msg in self.ingest_client.get_chat_history(ch, limit=per_channel_limit):
                     msg_time = msg.date.replace(tzinfo=timezone.utc)
                     if msg_time < since:
                         break
@@ -323,7 +330,6 @@ class NewsBot:
     async def on_new_message(self, _client: Client, msg: Message) -> None:
         if not self._is_tracked(msg):
             return
-
         text = message_to_text(msg)
         msg_time = msg.date.replace(tzinfo=timezone.utc)
         uname = msg.chat.username or str(msg.chat.id)
@@ -334,19 +340,20 @@ class NewsBot:
         rows = self.storage.get_messages_for_day(day_utc, self.settings.summary_max_items)
         summary = await self.summarizer.summarize(rows, day_utc)
 
-        chunks = split_telegram_text(summary)
-        for chunk in chunks:
-            await self.client.send_message(chat_id=self.settings.target_chat_id, text=chunk)
+        for chunk in split_telegram_text(summary):
+            await self.sender_client.send_message(chat_id=self.settings.target_chat_id, text=chunk)
 
         deleted = self.storage.cleanup_old(self.settings.retention_days)
         logging.info("Sent summary for %s. Cleanup removed %s old rows", day_utc, deleted)
 
     async def run(self) -> None:
-        @self.client.on_message()
+        @self.ingest_client.on_message()
         async def _handler(client: Client, msg: Message) -> None:
             await self.on_new_message(client, msg)
 
-        await self.client.start()
+        await self.ingest_client.start()
+        await self.sender_client.start()
+
         await self.bootstrap_channels()
         await self.backfill_recent(days=1)
 
@@ -364,7 +371,8 @@ class NewsBot:
         try:
             await stop_event.wait()
         finally:
-            await self.client.stop()
+            await self.ingest_client.stop()
+            await self.sender_client.stop()
             self.scheduler.shutdown(wait=False)
 
 

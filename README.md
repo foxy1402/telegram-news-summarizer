@@ -1,83 +1,101 @@
 # Telegram News Summarizer Bot (Dockerized)
 
-A Dockerized Pyrogram bot that:
-- reads Telegram channel posts from usernames in env vars
-- stores raw messages in local SQLite storage
-- keeps only the newest N days (default 7)
-- once per day (UTC), summarizes **yesterday**
-- ranks high-priority items via an OpenAI-compatible API
-- sends summary to your Telegram chat via bot token
+This project now uses a **userbot session** to read channel news, and a **bot token** only for sending your daily summary.
 
-## Architecture (important)
+## Important Design Choice
 
-- Ingestion client: Telegram **bot token** (`TELEGRAM_BOT_TOKEN`)
-- Summarization model: OpenAI-compatible `/chat/completions`
-- Storage: SQLite in `DATA_DIR/news.sqlite3`
-- Session: Pyrogram session files in `DATA_DIR`
+- Reading news channels: done by `TELEGRAM_USER_SESSION_STRING` (normal Telegram user account session)
+- Sending summary report: done by `TELEGRAM_BOT_TOKEN` to `TARGET_CHAT_ID`
 
-Because session + DB are in `DATA_DIR`, data survives restart only if `DATA_DIR` is mounted to persistent storage.
+Why: bot tokens often cannot read channels you do not own. A user session behaves like a normal Telegram account and can read public `@username` channels.
 
-## Limitations you should know first
+## Which Telegram account should be used?
 
-- Bot accounts can only read channels where the bot is actually allowed to read.
-- For channels you do not control, bot ingestion is not guaranteed unless owners/admins add your bot.
-- Daily summary is based on UTC day boundaries.
+Use a **second Telegram account** (not your main daily account) for userbot ingestion.
 
-## Project Files
+Recommended setup:
+- Account A (second account): used only to create `TELEGRAM_USER_SESSION_STRING` and read public channels
+- Account B (your main account): receives summary report via bot chat or group
 
-- `app/main.py`: bot logic
-- `requirements.txt`: Python dependencies
-- `Dockerfile`: image build
-- `docker-compose.yml`: local runtime example
-- `.env.example`: env template
+## Where will I read the summary report?
+
+Read it in your **main account** via the bot delivery target:
+- If `TARGET_CHAT_ID` is your private chat ID, you read it in your DM with the bot.
+- If `TARGET_CHAT_ID` is a group ID, you read it in that group.
+
+So delivery is from **bot token chat**, not from the second account directly.
+
+## Retention Policy
+
+News DB retention is now **1 day**.
+
+- `RETENTION_DAYS=1`
+- After daily summary is sent, older rows are deleted automatically.
 
 ## 1) Prerequisites
 
 - Docker + Docker Compose
-- Telegram API credentials (`api_id`, `api_hash`) from https://my.telegram.org
-- Telegram bot token from @BotFather
-- Target chat ID where summaries are sent
-- OpenAI-compatible provider endpoint + API key + model name
+- Telegram `api_id` + `api_hash` from https://my.telegram.org
+- One second Telegram account for ingestion session
+- One bot token from @BotFather for summary delivery
+- OpenAI-compatible API (`/chat/completions`)
 
 ## 2) Create Telegram Credentials
 
-### 2.1 Telegram API ID / API Hash
+### 2.1 API ID and API Hash
 
-1. Go to https://my.telegram.org
-2. Log in with your phone number
+1. Open https://my.telegram.org
+2. Log in
 3. Open `API development tools`
-4. Create app (if needed)
-5. Copy `api_id` and `api_hash`
+4. Create app if needed
+5. Save `api_id` and `api_hash`
 
-### 2.2 Bot Token
+These are used for both user session and bot sender client.
 
-1. Open Telegram
-2. Chat with `@BotFather`
-3. Use `/newbot`
-4. Copy the token string into `TELEGRAM_BOT_TOKEN`
+### 2.2 Create bot token (for report delivery only)
 
-### 2.3 Target Chat ID
+1. Open Telegram and chat with `@BotFather`
+2. Run `/newbot`
+3. Copy token into `TELEGRAM_BOT_TOKEN`
+4. In your main account, open the bot chat and press `Start`
 
-Use one of these quick methods:
-- Add your bot to a private group, send one test message, then read updates via Telegram API.
-- Or message your bot directly and use a helper bot/API call to inspect chat id.
+### 2.3 Create userbot session string (second account)
 
-`TARGET_CHAT_ID` examples:
-- Personal chat: positive integer (example `123456789`)
-- Group/supergroup: negative integer (example `-1001234567890`)
+You need a session string for `TELEGRAM_USER_SESSION_STRING`.
+
+Use this one-time local script (run outside container):
+
+```python
+from pyrogram import Client
+
+api_id = 123456
+api_hash = "your_api_hash"
+
+with Client("session_maker", api_id=api_id, api_hash=api_hash) as app:
+    print(app.export_session_string())
+```
+
+Flow:
+- It asks phone number of your second account
+- Enter Telegram OTP code
+- If enabled, enter cloud password
+- It prints a long session string
+
+Copy that string into `.env` as `TELEGRAM_USER_SESSION_STRING`.
 
 ## 3) Configure Environment Variables
 
-Copy `.env.example` to `.env` and fill every required field.
+Copy template:
 
 ```bash
 cp .env.example .env
 ```
 
-### Required env vars
+Set required vars:
 
 - `TELEGRAM_API_ID`
 - `TELEGRAM_API_HASH`
+- `TELEGRAM_USER_SESSION_STRING`
 - `TELEGRAM_BOT_TOKEN`
 - `TARGET_CHAT_ID`
 - `CHANNEL_USERNAMES`
@@ -85,96 +103,58 @@ cp .env.example .env
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL`
 
-### Optional env vars (recommended defaults already set)
+Optional tuning:
 
 - `SUMMARY_SEND_TIME_UTC` default `00:10`
 - `SUMMARY_TOP_K` default `12`
 - `SUMMARY_MAX_ITEMS` default `80`
 - `SUMMARY_MAX_CHARS_PER_ITEM` default `700`
-- `RETENTION_DAYS` default `7`
+- `RETENTION_DAYS` default `1`
 - `DATA_DIR` default `/news_data`
-- `LOG_LEVEL` default `INFO`
-
-### Full env var reference
-
-- `TELEGRAM_API_ID`: integer API id from my.telegram.org
-- `TELEGRAM_API_HASH`: API hash from my.telegram.org
-- `TELEGRAM_BOT_TOKEN`: BotFather token used for channel read + send
-- `TARGET_CHAT_ID`: chat/group id where daily summary is delivered
-- `CHANNEL_USERNAMES`: comma-separated usernames, example `cnn,bbcnews,reuters`
-- `OPENAI_BASE_URL`: base URL ending in `/v1` for OpenAI-compatible API
-- `OPENAI_API_KEY`: API key for the LLM provider
-- `OPENAI_MODEL`: model id, example `gpt-4o-mini`
-- `SUMMARY_SEND_TIME_UTC`: HH:MM UTC, runs daily summary for yesterday
-- `SUMMARY_TOP_K`: number of ranked highlights in output
-- `SUMMARY_MAX_ITEMS`: max stored messages passed into ranking each day
-- `SUMMARY_MAX_CHARS_PER_ITEM`: truncate each message before prompt
-- `RETENTION_DAYS`: keep latest N days, older rows auto-deleted
-- `DATA_DIR`: absolute in-container folder for SQLite + session
-- `LOG_LEVEL`: `DEBUG`, `INFO`, `WARNING`, `ERROR`
 
 ## 4) Persistent Storage and Mount Path
 
-`DATA_DIR` must match your platform mount path.
+`DATA_DIR` must exactly match your container mount path.
 
 Examples:
-- If mount path is `/news_data`, set `DATA_DIR=/news_data`
-- If mount path is `/var/lib/telegram-news`, set `DATA_DIR=/var/lib/telegram-news`
+- Mount path is `/news_data` -> set `DATA_DIR=/news_data`
+- Mount path is `/data` -> set `DATA_DIR=/data`
+- Mount path is `/var/lib/telegram-news` -> set `DATA_DIR=/var/lib/telegram-news`
 
-If mount path and `DATA_DIR` do not match, the bot appears to run but session/database may reset after restart.
+If this is mismatched, SQLite/session files will not persist between restarts.
 
-## 5) Run Locally with Docker Compose
+## 5) Local Run with Docker Compose
 
-1. Ensure `.env` is configured
-2. Start service:
+1. Fill `.env`
+2. Start:
 
 ```bash
 docker compose up -d --build
 ```
 
-3. View logs:
+3. Logs:
 
 ```bash
 docker compose logs -f news-bot
 ```
 
-4. Stop service:
+4. Stop:
 
 ```bash
 docker compose down
 ```
 
-Local compose currently mounts:
-- host `./news_data` -> container `/news_data`
+## 6) Deploy from GHCR
 
-So set in `.env`:
-- `DATA_DIR=/news_data`
-
-## 6) Build and Push to GHCR
-
-### 6.1 Login
+### Build and push
 
 ```bash
 echo $CR_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
-```
-
-`CR_PAT` should have package write permission.
-
-### 6.2 Build image
-
-```bash
 docker build -t ghcr.io/YOUR_GITHUB_USER/telegram-news-summarizer:latest .
-```
-
-### 6.3 Push image
-
-```bash
 docker push ghcr.io/YOUR_GITHUB_USER/telegram-news-summarizer:latest
 ```
 
-### 6.4 Deploy image
-
-Use this service template:
+### Deploy service
 
 ```yaml
 services:
@@ -187,64 +167,51 @@ services:
       - /your/persistent/host/path:/your/container/mount/path
 ```
 
-Then set in env:
+Then set:
 
-```bash
+```env
 DATA_DIR=/your/container/mount/path
 ```
 
-## 7) Deploy on PaaS (generic checklist)
-
-1. Create service from your GHCR image
-2. Add all env vars from `.env.example`
-3. Add a persistent disk/volume
-4. Set mount path (example `/data`)
-5. Set `DATA_DIR` to exactly that path (`/data`)
-6. Deploy and check logs
-7. Confirm first summary arrives at `TARGET_CHAT_ID` after schedule time
-
-## 8) Runtime Behavior
+## 7) Runtime Behavior
 
 - Startup:
-  - creates/opens SQLite database
-  - resolves channel usernames
-  - backfills roughly last 1 day per channel
+  - connect user session and sender bot
+  - resolve channels from `CHANNEL_USERNAMES`
+  - backfill about 1 day of recent posts
 - Live:
-  - stores new posts as they arrive
+  - store new channel posts continuously
 - Daily schedule:
-  - loads yesterday (UTC) posts
-  - asks LLM to rank and summarize top items
-  - sends summary to target chat (auto-chunk if too long)
-  - deletes rows older than `RETENTION_DAYS`
+  - summarize yesterday UTC posts
+  - rank highest-priority items
+  - send summary to `TARGET_CHAT_ID`
+  - cleanup data older than 1 day
 
-## 9) Troubleshooting
+## 8) Troubleshooting
 
-- No messages collected:
-  - bot likely cannot read that channel
-  - verify bot is added/allowed in channel
-- 401/403 from LLM provider:
-  - check `OPENAI_BASE_URL` and `OPENAI_API_KEY`
-- No daily summary:
-  - verify `SUMMARY_SEND_TIME_UTC` format (`HH:MM`)
-  - check container timezone assumptions (scheduler uses UTC)
-  - confirm `TARGET_CHAT_ID` is correct
-- Data not persistent:
-  - verify volume mount exists
-  - verify `DATA_DIR` equals container mount path
+- No channel data:
+  - verify `TELEGRAM_USER_SESSION_STRING` is valid
+  - verify channel usernames are correct public channels
+- Bot cannot send report:
+  - ensure your main account clicked `Start` in bot chat
+  - verify `TARGET_CHAT_ID`
+- No persistence:
+  - verify mount exists and `DATA_DIR` matches mount path
 
-## 10) Security Notes
+## 9) Security
 
 - Never commit `.env`
-- Rotate API keys/tokens if leaked
-- Use least-privilege tokens where possible
+- Treat `TELEGRAM_USER_SESSION_STRING` as highly sensitive
+- Rotate API keys and bot token if leaked
 
-## 11) Minimal Example `.env`
+## 10) Minimal `.env` Example
 
 ```env
 TELEGRAM_API_ID=123456
 TELEGRAM_API_HASH=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TELEGRAM_USER_SESSION_STRING=1BQANOTAREALSTRING...
 TELEGRAM_BOT_TOKEN=1234567890:AA...
-TARGET_CHAT_ID=-1001234567890
+TARGET_CHAT_ID=123456789
 CHANNEL_USERNAMES=cnn,bbcnews,reuters
 
 OPENAI_BASE_URL=https://api.openai.com/v1
@@ -255,7 +222,7 @@ SUMMARY_SEND_TIME_UTC=00:10
 SUMMARY_TOP_K=12
 SUMMARY_MAX_ITEMS=80
 SUMMARY_MAX_CHARS_PER_ITEM=700
-RETENTION_DAYS=7
+RETENTION_DAYS=1
 DATA_DIR=/news_data
 LOG_LEVEL=INFO
 ```
