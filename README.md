@@ -106,7 +106,10 @@ Set required vars:
 Optional tuning:
 
 - `SUMMARY_SEND_TIME_UTC` default `00:10`
-- `SUMMARY_TOP_K` default `12`
+- `SUMMARY_MIN_ITEMS` default `5`
+- `SUMMARY_MAX_ITEMS_IN_REPORT` default `10`
+- `SUMMARY_CATEGORY_COUNT` default `3`
+- `SUMMARY_ITEM_WORD_LIMIT` default `35`
 - `SUMMARY_MAX_ITEMS` default `80`
 - `SUMMARY_MAX_CHARS_PER_ITEM` default `700`
 - `RETENTION_DAYS` default `1`
@@ -183,7 +186,9 @@ DATA_DIR=/your/container/mount/path
   - store new channel posts continuously
 - Daily schedule:
   - summarize yesterday UTC posts
-  - rank highest-priority items
+  - rank highest-priority items only
+  - compress into 2-4 categories (target 3)
+  - keep final report to about 5-10 items total
   - send summary to `TARGET_CHAT_ID`
   - cleanup data older than 1 day
 
@@ -219,7 +224,10 @@ OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4o-mini
 
 SUMMARY_SEND_TIME_UTC=00:10
-SUMMARY_TOP_K=12
+SUMMARY_MIN_ITEMS=5
+SUMMARY_MAX_ITEMS_IN_REPORT=10
+SUMMARY_CATEGORY_COUNT=3
+SUMMARY_ITEM_WORD_LIMIT=35
 SUMMARY_MAX_ITEMS=80
 SUMMARY_MAX_CHARS_PER_ITEM=700
 RETENTION_DAYS=1

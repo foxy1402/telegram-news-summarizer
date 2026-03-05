@@ -43,7 +43,10 @@ class Settings:
     openai_base_url: str
     openai_api_key: str
     openai_model: str
-    summary_top_k: int
+    summary_min_items: int
+    summary_max_items_in_report: int
+    summary_category_count: int
+    summary_item_word_limit: int
     summary_max_items: int
     summary_max_chars_per_item: int
     summary_send_time_utc: str
@@ -70,7 +73,10 @@ class Settings:
             openai_base_url=env_required("OPENAI_BASE_URL").rstrip("/"),
             openai_api_key=env_required("OPENAI_API_KEY"),
             openai_model=env_required("OPENAI_MODEL"),
-            summary_top_k=int(os.getenv("SUMMARY_TOP_K", "12")),
+            summary_min_items=int(os.getenv("SUMMARY_MIN_ITEMS", "5")),
+            summary_max_items_in_report=int(os.getenv("SUMMARY_MAX_ITEMS_IN_REPORT", "10")),
+            summary_category_count=int(os.getenv("SUMMARY_CATEGORY_COUNT", "3")),
+            summary_item_word_limit=int(os.getenv("SUMMARY_ITEM_WORD_LIMIT", "35")),
             summary_max_items=int(os.getenv("SUMMARY_MAX_ITEMS", "80")),
             summary_max_chars_per_item=int(os.getenv("SUMMARY_MAX_CHARS_PER_ITEM", "700")),
             summary_send_time_utc=os.getenv("SUMMARY_SEND_TIME_UTC", "00:10"),
@@ -205,11 +211,20 @@ class Summarizer:
             "Output valid JSON only with this shape:\n"
             "{\n"
             "  \"headline\": \"string\",\n"
-            "  \"highlights\": [\n"
-            "    {\"rank\": 1, \"source\": \"@channel\", \"why_important\": \"string\", \"summary\": \"string\"}\n"
+            "  \"quick_take\": \"string\",\n"
+            "  \"categories\": [\n"
+            "    {\n"
+            "      \"name\": \"string\",\n"
+            "      \"items\": [\n"
+            "        {\"rank\": 1, \"source\": \"@channel\", \"why_important\": \"string\", \"summary\": \"string\"}\n"
+            "      ]\n"
+            "    }\n"
             "  ]\n"
             "}\n"
-            f"Keep exactly top {self.settings.summary_top_k} highlights.\n"
+            f"Select between {self.settings.summary_min_items} and {self.settings.summary_max_items_in_report} total items.\n"
+            f"Use 2 to 4 categories (target: {self.settings.summary_category_count}).\n"
+            f"Maximum {self.settings.summary_item_word_limit} words for each item summary.\n"
+            "Each why_important must be one short sentence.\n"
             "Focus on globally/materially important developments, avoid duplicates, and ignore low-signal chatter.\n"
             f"Day (UTC): {day_utc.isoformat()}\n"
             "Posts:\n"
@@ -253,19 +268,34 @@ class Summarizer:
             return f"Daily News Summary for {day_utc.isoformat()} (UTC)\n\n{content}"
 
         headline = parsed.get("headline", f"Top News {day_utc.isoformat()}")
-        highlights = parsed.get("highlights", [])
+        quick_take = parsed.get("quick_take", "")
+        categories = parsed.get("categories", [])
 
-        lines = [f"Daily News Summary for {day_utc.isoformat()} (UTC)", "", f"{headline}", ""]
-        for i, h in enumerate(highlights, start=1):
-            source = h.get("source", "unknown")
-            why = h.get("why_important", "")
-            summary = h.get("summary", "")
-            lines.append(f"{i}. {source}")
-            if why:
-                lines.append(f"Why: {why}")
-            if summary:
-                lines.append(f"Summary: {summary}")
+        lines = [f"Daily News Summary for {day_utc.isoformat()} (UTC)", "", f"{headline}"]
+        if quick_take:
+            lines.extend(["", f"Quick take: {quick_take}"])
+
+        item_counter = 0
+        lines.append("")
+        for cat in categories:
+            name = str(cat.get("name", "General")).strip() or "General"
+            items = cat.get("items", [])
+            if not isinstance(items, list) or not items:
+                continue
+            lines.append(f"[{name}]")
+            for h in items:
+                if item_counter >= self.settings.summary_max_items_in_report:
+                    break
+                source = h.get("source", "unknown")
+                why = h.get("why_important", "")
+                summary = h.get("summary", "")
+                item_counter += 1
+                lines.append(f"{item_counter}. {source}: {summary}")
+                if why:
+                    lines.append(f"   Why: {why}")
             lines.append("")
+            if item_counter >= self.settings.summary_max_items_in_report:
+                break
 
         return "\n".join(lines).strip()
 
