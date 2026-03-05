@@ -80,6 +80,26 @@ SUMMARY_MAX_CHARS_PER_ITEM=700
 RETENTION_DAYS=1
 ```
 
+## Reliability controls
+
+```env
+LLM_TIMEOUT_SECONDS=120
+LLM_RETRY_BASE_SECONDS=2
+LLM_RETRY_MAX_SECONDS=120
+LLM_RETRY_MAX_ATTEMPTS=60
+TELEGRAM_SEND_RETRY_BASE_SECONDS=2
+TELEGRAM_SEND_RETRY_MAX_SECONDS=60
+TELEGRAM_SEND_RETRY_MAX_ATTEMPTS=20
+```
+
+LLM call behavior:
+- Retries timeout, network errors, `429`, and `5xx`.
+- Stops after `LLM_RETRY_MAX_ATTEMPTS` and sends a fallback report.
+
+Telegram send behavior:
+- Retries transient send failures with exponential backoff.
+- Handles `FloodWait` by sleeping the required seconds.
+
 ## Mixed-language channels
 
 Yes, channels can be mixed language (English, Vietnamese, etc.).
@@ -88,6 +108,10 @@ Use:
 - `REPORT_LANGUAGE=Vietnamese` for Vietnamese output
 
 The bot will ingest mixed-language source posts and ask LLM to output the final report in your chosen report language.
+
+## Notes
+
+- `tgcrypto` is intentionally not required in this image to improve cross-platform build reliability (`amd64` and `arm64`). Pyrogram still works without it (slower crypto path).
 
 ## Where you read the report
 

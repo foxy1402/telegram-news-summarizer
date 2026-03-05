@@ -1,7 +1,6 @@
 services:
   news-bot:
-    build: .
-    image: ghcr.io/your-user/telegram-news-summarizer:latest
+    image: ghcr.io/foxy1402/telegram-news-summarizer:latest
     container_name: telegram-news-summarizer
     restart: unless-stopped
     env_file:

@@ -13,7 +13,7 @@ from typing import List
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pyrogram import Client
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, RPCError
 from pyrogram.types import Message
 
 
@@ -55,6 +55,10 @@ class Settings:
     llm_timeout_seconds: int
     llm_retry_base_seconds: int
     llm_retry_max_seconds: int
+    llm_retry_max_attempts: int
+    telegram_send_retry_base_seconds: int
+    telegram_send_retry_max_seconds: int
+    telegram_send_retry_max_attempts: int
     data_dir: Path
 
     @staticmethod
@@ -67,7 +71,7 @@ class Settings:
         data_dir = Path(os.getenv("DATA_DIR", "/news_data")).resolve()
         data_dir.mkdir(parents=True, exist_ok=True)
 
-        return Settings(
+        settings = Settings(
             api_id=int(env_required("TELEGRAM_API_ID")),
             api_hash=env_required("TELEGRAM_API_HASH"),
             user_session_string=env_required("TELEGRAM_USER_SESSION_STRING"),
@@ -89,8 +93,42 @@ class Settings:
             llm_timeout_seconds=int(os.getenv("LLM_TIMEOUT_SECONDS", "120")),
             llm_retry_base_seconds=int(os.getenv("LLM_RETRY_BASE_SECONDS", "2")),
             llm_retry_max_seconds=int(os.getenv("LLM_RETRY_MAX_SECONDS", "120")),
+            llm_retry_max_attempts=int(os.getenv("LLM_RETRY_MAX_ATTEMPTS", "60")),
+            telegram_send_retry_base_seconds=int(os.getenv("TELEGRAM_SEND_RETRY_BASE_SECONDS", "2")),
+            telegram_send_retry_max_seconds=int(os.getenv("TELEGRAM_SEND_RETRY_MAX_SECONDS", "60")),
+            telegram_send_retry_max_attempts=int(os.getenv("TELEGRAM_SEND_RETRY_MAX_ATTEMPTS", "20")),
             data_dir=data_dir,
         )
+        settings.validate()
+        return settings
+
+    def validate(self) -> None:
+        if self.summary_min_items < 1:
+            raise RuntimeError("SUMMARY_MIN_ITEMS must be >= 1")
+        if self.summary_max_items_in_report < 1:
+            raise RuntimeError("SUMMARY_MAX_ITEMS_IN_REPORT must be >= 1")
+        if self.summary_min_items > self.summary_max_items_in_report:
+            raise RuntimeError("SUMMARY_MIN_ITEMS cannot be greater than SUMMARY_MAX_ITEMS_IN_REPORT")
+        if self.summary_category_count < 1:
+            raise RuntimeError("SUMMARY_CATEGORY_COUNT must be >= 1")
+        if self.summary_item_word_limit < 1:
+            raise RuntimeError("SUMMARY_ITEM_WORD_LIMIT must be >= 1")
+        if self.summary_max_items < 1:
+            raise RuntimeError("SUMMARY_MAX_ITEMS must be >= 1")
+        if self.summary_max_chars_per_item < 1:
+            raise RuntimeError("SUMMARY_MAX_CHARS_PER_ITEM must be >= 1")
+        if self.retention_days < 1:
+            raise RuntimeError("RETENTION_DAYS must be >= 1")
+        if self.llm_timeout_seconds < 1:
+            raise RuntimeError("LLM_TIMEOUT_SECONDS must be >= 1")
+        if self.llm_retry_base_seconds < 1 or self.llm_retry_max_seconds < 1:
+            raise RuntimeError("LLM retry seconds must be >= 1")
+        if self.llm_retry_max_attempts < 1:
+            raise RuntimeError("LLM_RETRY_MAX_ATTEMPTS must be >= 1")
+        if self.telegram_send_retry_base_seconds < 1 or self.telegram_send_retry_max_seconds < 1:
+            raise RuntimeError("TELEGRAM_SEND_RETRY_*_SECONDS must be >= 1")
+        if self.telegram_send_retry_max_attempts < 1:
+            raise RuntimeError("TELEGRAM_SEND_RETRY_MAX_ATTEMPTS must be >= 1")
 
 
 class NewsStorage:
@@ -226,15 +264,19 @@ class Summarizer:
                 return resp.json()
             except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError) as e:
                 status_code = None
+                retry_after = None
                 if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
                     status_code = e.response.status_code
                     if 400 <= status_code < 500 and status_code != 429:
                         raise
+                    retry_after = e.response.headers.get("Retry-After")
 
                 delay = min(
                     self.settings.llm_retry_max_seconds,
                     self.settings.llm_retry_base_seconds * (2 ** (attempt - 1)),
                 )
+                if retry_after and retry_after.isdigit():
+                    delay = max(delay, int(retry_after))
                 logging.warning(
                     "LLM call failed (attempt=%s, status=%s, error=%s). Retrying in %ss",
                     attempt,
@@ -242,7 +284,34 @@ class Summarizer:
                     str(e),
                     delay,
                 )
+                if attempt >= self.settings.llm_retry_max_attempts:
+                    raise RuntimeError(
+                        f"LLM call failed after {attempt} attempts; last_status={status_code}"
+                    ) from e
                 await asyncio.sleep(delay)
+
+    @staticmethod
+    def _extract_content(data: dict) -> str:
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("LLM response missing choices")
+
+        message = choices[0].get("message", {})
+        content = message.get("content", "")
+
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            if parts:
+                return "".join(parts)
+
+        raise RuntimeError("LLM response content format unsupported")
 
     def _build_prompt(self, rows: List[sqlite3.Row], day_utc: date) -> str:
         items = []
@@ -302,7 +371,10 @@ class Summarizer:
         }
         data = await self._post_with_retry(payload)
 
-        content = data["choices"][0]["message"]["content"]
+        content = self._extract_content(data)
+        content = content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.S).strip()
 
         try:
             parsed = json.loads(content)
@@ -411,13 +483,69 @@ class NewsBot:
     async def send_daily_summary(self) -> None:
         day_utc = (datetime.now(timezone.utc) - timedelta(days=1)).date()
         rows = self.storage.get_messages_for_day(day_utc, self.settings.summary_max_items)
-        summary = await self.summarizer.summarize(rows, day_utc)
+        send_error: Exception | None = None
+        try:
+            summary = await self.summarizer.summarize(rows, day_utc)
+        except Exception:
+            logging.exception("Failed to create LLM summary for %s; using fallback summary", day_utc)
+            summary = self._fallback_summary(rows, day_utc)
 
         for chunk in split_telegram_text(summary):
-            await self.sender_client.send_message(chat_id=self.settings.target_chat_id, text=chunk)
+            try:
+                await self._send_chunk_with_retry(chunk)
+            except Exception as e:
+                send_error = e
+                logging.exception("Failed sending summary chunk for %s", day_utc)
+                break
 
         deleted = self.storage.cleanup_old(self.settings.retention_days)
-        logging.info("Sent summary for %s. Cleanup removed %s old rows", day_utc, deleted)
+        logging.info("Summary run for %s finished. Cleanup removed %s old rows", day_utc, deleted)
+        if send_error is not None:
+            raise send_error
+
+    async def _send_chunk_with_retry(self, text: str) -> None:
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                await self.sender_client.send_message(chat_id=self.settings.target_chat_id, text=text)
+                return
+            except FloodWait as e:
+                logging.warning("Telegram FloodWait while sending summary. Sleeping %s sec", e.value)
+                await asyncio.sleep(e.value)
+            except RPCError:
+                # Most RPC errors are permanent (e.g., chat not found / bot blocked).
+                raise
+            except Exception as e:
+                delay = min(
+                    self.settings.telegram_send_retry_max_seconds,
+                    self.settings.telegram_send_retry_base_seconds * (2 ** (attempt - 1)),
+                )
+                logging.warning(
+                    "Telegram send failed (attempt=%s, error=%s). Retrying in %ss",
+                    attempt,
+                    str(e),
+                    delay,
+                )
+                if attempt >= self.settings.telegram_send_retry_max_attempts:
+                    raise RuntimeError(
+                        f"Telegram send failed after {attempt} attempts"
+                    ) from e
+                await asyncio.sleep(delay)
+
+    def _fallback_summary(self, rows: List[sqlite3.Row], day_utc: date) -> str:
+        lines = [f"Daily News Summary for {day_utc.isoformat()} (UTC)", ""]
+        if not rows:
+            lines.append("No messages collected from configured channels for yesterday.")
+            return "\n".join(lines)
+
+        lines.append("LLM summary unavailable. Fallback: latest important-looking posts.")
+        lines.append("")
+        for idx, row in enumerate(rows[-self.settings.summary_min_items :], start=1):
+            text = re.sub(r"\s+", " ", row["text"]).strip()
+            text = text[:220]
+            lines.append(f"{idx}. @{row['channel_username']}: {text}")
+        return "\n".join(lines)
 
     async def run(self) -> None:
         @self.ingest_client.on_message()
