@@ -1,0 +1,407 @@
+import asyncio
+import json
+import logging
+import os
+import re
+import sqlite3
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import List, Optional
+
+import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from pyrogram import Client
+from pyrogram.errors import FloodWait
+from pyrogram.types import Message
+
+
+def setup_logging() -> None:
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+def env_required(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return value
+
+
+@dataclass
+class Settings:
+    api_id: int
+    api_hash: str
+    bot_token: str
+    target_chat_id: int
+    channel_usernames: List[str]
+    openai_base_url: str
+    openai_api_key: str
+    openai_model: str
+    summary_top_k: int
+    summary_max_items: int
+    summary_max_chars_per_item: int
+    summary_send_time_utc: str
+    retention_days: int
+    data_dir: Path
+
+    @staticmethod
+    def load() -> "Settings":
+        channels_raw = env_required("CHANNEL_USERNAMES")
+        channel_usernames = [c.strip() for c in channels_raw.split(",") if c.strip()]
+        if not channel_usernames:
+            raise RuntimeError("CHANNEL_USERNAMES must include at least one username")
+
+        data_dir = Path(os.getenv("DATA_DIR", "/news_data")).resolve()
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        return Settings(
+            api_id=int(env_required("TELEGRAM_API_ID")),
+            api_hash=env_required("TELEGRAM_API_HASH"),
+            bot_token=env_required("TELEGRAM_BOT_TOKEN"),
+            target_chat_id=int(env_required("TARGET_CHAT_ID")),
+            channel_usernames=channel_usernames,
+            openai_base_url=env_required("OPENAI_BASE_URL").rstrip("/"),
+            openai_api_key=env_required("OPENAI_API_KEY"),
+            openai_model=env_required("OPENAI_MODEL"),
+            summary_top_k=int(os.getenv("SUMMARY_TOP_K", "12")),
+            summary_max_items=int(os.getenv("SUMMARY_MAX_ITEMS", "80")),
+            summary_max_chars_per_item=int(os.getenv("SUMMARY_MAX_CHARS_PER_ITEM", "700")),
+            summary_send_time_utc=os.getenv("SUMMARY_SEND_TIME_UTC", "00:10"),
+            retention_days=int(os.getenv("RETENTION_DAYS", "7")),
+            data_dir=data_dir,
+        )
+
+
+class NewsStorage:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_username TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    date_utc TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at_utc TEXT NOT NULL,
+                    UNIQUE(chat_id, message_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_messages_date_utc
+                ON messages(date_utc)
+                """
+            )
+            conn.commit()
+
+    def save_message(
+        self,
+        channel_username: str,
+        chat_id: int,
+        message_id: int,
+        dt_utc: datetime,
+        text: str,
+    ) -> None:
+        if not text.strip():
+            return
+
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO messages (
+                    channel_username, chat_id, message_id, date_utc, text, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    channel_username,
+                    chat_id,
+                    message_id,
+                    dt_utc.isoformat(),
+                    text.strip(),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def get_messages_for_day(self, day_utc: date, max_items: int) -> List[sqlite3.Row]:
+        start = datetime(day_utc.year, day_utc.month, day_utc.day, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT channel_username, chat_id, message_id, date_utc, text
+                FROM messages
+                WHERE date_utc >= ? AND date_utc < ?
+                ORDER BY date_utc ASC
+                LIMIT ?
+                """,
+                (start.isoformat(), end.isoformat(), max_items),
+            ).fetchall()
+            return rows
+
+    def cleanup_old(self, retention_days: int) -> int:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        with closing(self._connect()) as conn:
+            cur = conn.execute(
+                "DELETE FROM messages WHERE date_utc < ?",
+                (cutoff.isoformat(),),
+            )
+            conn.commit()
+            return cur.rowcount
+
+
+def message_to_text(msg: Message) -> str:
+    parts = []
+    if msg.text:
+        parts.append(msg.text)
+    if msg.caption:
+        parts.append(msg.caption)
+    if msg.poll and msg.poll.question:
+        parts.append(f"Poll: {msg.poll.question}")
+    if msg.media:
+        parts.append(f"[media={msg.media.value}]")
+    return "\n".join(parts).strip()
+
+
+class Summarizer:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    def _build_prompt(self, rows: List[sqlite3.Row], day_utc: date) -> str:
+        items = []
+        for idx, row in enumerate(rows, start=1):
+            text = re.sub(r"\s+", " ", row["text"]).strip()
+            text = text[: self.settings.summary_max_chars_per_item]
+            items.append(
+                f"[{idx}] channel=@{row['channel_username']} "
+                f"msg_id={row['message_id']} time={row['date_utc']} text={text}"
+            )
+
+        joined = "\n".join(items)
+
+        return (
+            "You are a news analyst.\n"
+            "Given Telegram channel posts for one UTC day, rank by importance and create a concise summary.\n"
+            "Output valid JSON only with this shape:\n"
+            "{\n"
+            "  \"headline\": \"string\",\n"
+            "  \"highlights\": [\n"
+            "    {\"rank\": 1, \"source\": \"@channel\", \"why_important\": \"string\", \"summary\": \"string\"}\n"
+            "  ]\n"
+            "}\n"
+            f"Keep exactly top {self.settings.summary_top_k} highlights.\n"
+            "Focus on globally/materially important developments, avoid duplicates, and ignore low-signal chatter.\n"
+            f"Day (UTC): {day_utc.isoformat()}\n"
+            "Posts:\n"
+            f"{joined}"
+        )
+
+    async def summarize(self, rows: List[sqlite3.Row], day_utc: date) -> str:
+        if not rows:
+            return (
+                f"Daily News Summary for {day_utc.isoformat()} (UTC)\n\n"
+                "No messages collected from configured channels for yesterday."
+            )
+
+        prompt = self._build_prompt(rows, day_utc)
+        url = f"{self.settings.openai_base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.settings.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.settings.openai_model,
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": "Return strict JSON."},
+                {"role": "user", "content": prompt},
+            ],
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        content = data["choices"][0]["message"]["content"]
+
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            logging.warning("LLM returned non-JSON output; sending raw text")
+            return f"Daily News Summary for {day_utc.isoformat()} (UTC)\n\n{content}"
+
+        headline = parsed.get("headline", f"Top News {day_utc.isoformat()}")
+        highlights = parsed.get("highlights", [])
+
+        lines = [f"Daily News Summary for {day_utc.isoformat()} (UTC)", "", f"{headline}", ""]
+        for i, h in enumerate(highlights, start=1):
+            source = h.get("source", "unknown")
+            why = h.get("why_important", "")
+            summary = h.get("summary", "")
+            lines.append(f"{i}. {source}")
+            if why:
+                lines.append(f"Why: {why}")
+            if summary:
+                lines.append(f"Summary: {summary}")
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
+
+class NewsBot:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.client = Client(
+            name=str(settings.data_dir / "pyrogram_session"),
+            api_id=settings.api_id,
+            api_hash=settings.api_hash,
+            bot_token=settings.bot_token,
+            workdir=str(settings.data_dir),
+        )
+        self.storage = NewsStorage(settings.data_dir / "news.sqlite3")
+        self.summarizer = Summarizer(settings)
+        self.scheduler = AsyncIOScheduler(timezone="UTC")
+        self._channel_chat_ids = set()
+
+    async def bootstrap_channels(self) -> None:
+        for username in self.settings.channel_usernames:
+            ch = username if username.startswith("@") else f"@{username}"
+            try:
+                chat = await self.client.get_chat(ch)
+                self._channel_chat_ids.add(chat.id)
+                logging.info("Tracking channel %s (id=%s)", ch, chat.id)
+            except Exception:
+                logging.exception("Failed to access channel %s. Ensure bot is added.", ch)
+
+    def _is_tracked(self, msg: Message) -> bool:
+        if not msg.chat:
+            return False
+        return msg.chat.id in self._channel_chat_ids
+
+    async def backfill_recent(self, days: int = 1, per_channel_limit: int = 500) -> None:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        for username in self.settings.channel_usernames:
+            ch = username if username.startswith("@") else f"@{username}"
+            count = 0
+            try:
+                async for msg in self.client.get_chat_history(ch, limit=per_channel_limit):
+                    msg_time = msg.date.replace(tzinfo=timezone.utc)
+                    if msg_time < since:
+                        break
+                    text = message_to_text(msg)
+                    uname = msg.chat.username or ch.lstrip("@")
+                    self.storage.save_message(uname, msg.chat.id, msg.id, msg_time, text)
+                    count += 1
+                    await asyncio.sleep(0)
+                logging.info("Backfilled %s messages for %s", count, ch)
+            except FloodWait as e:
+                logging.warning("FloodWait during backfill for %s, sleeping %s sec", ch, e.value)
+                await asyncio.sleep(e.value)
+            except Exception:
+                logging.exception("Failed backfill for %s", ch)
+
+    async def on_new_message(self, _client: Client, msg: Message) -> None:
+        if not self._is_tracked(msg):
+            return
+
+        text = message_to_text(msg)
+        msg_time = msg.date.replace(tzinfo=timezone.utc)
+        uname = msg.chat.username or str(msg.chat.id)
+        self.storage.save_message(uname, msg.chat.id, msg.id, msg_time, text)
+
+    async def send_daily_summary(self) -> None:
+        day_utc = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        rows = self.storage.get_messages_for_day(day_utc, self.settings.summary_max_items)
+        summary = await self.summarizer.summarize(rows, day_utc)
+
+        chunks = split_telegram_text(summary)
+        for chunk in chunks:
+            await self.client.send_message(chat_id=self.settings.target_chat_id, text=chunk)
+
+        deleted = self.storage.cleanup_old(self.settings.retention_days)
+        logging.info("Sent summary for %s. Cleanup removed %s old rows", day_utc, deleted)
+
+    async def run(self) -> None:
+        @self.client.on_message()
+        async def _handler(client: Client, msg: Message) -> None:
+            await self.on_new_message(client, msg)
+
+        await self.client.start()
+        await self.bootstrap_channels()
+        await self.backfill_recent(days=1)
+
+        hh, mm = parse_hh_mm(self.settings.summary_send_time_utc)
+        self.scheduler.add_job(self.send_daily_summary, "cron", hour=hh, minute=mm)
+        self.scheduler.start()
+
+        logging.info(
+            "Bot started. Daily summary schedule: %s UTC. Tracking %s channels.",
+            self.settings.summary_send_time_utc,
+            len(self._channel_chat_ids),
+        )
+
+        stop_event = asyncio.Event()
+        try:
+            await stop_event.wait()
+        finally:
+            await self.client.stop()
+            self.scheduler.shutdown(wait=False)
+
+
+def parse_hh_mm(value: str) -> tuple[int, int]:
+    m = re.fullmatch(r"(\d{2}):(\d{2})", value.strip())
+    if not m:
+        raise RuntimeError("SUMMARY_SEND_TIME_UTC must be HH:MM")
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise RuntimeError("SUMMARY_SEND_TIME_UTC out of range")
+    return hh, mm
+
+
+def split_telegram_text(text: str, chunk_size: int = 3900) -> List[str]:
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        if end < len(text):
+            nl = text.rfind("\n", start, end)
+            if nl > start + 400:
+                end = nl
+        chunks.append(text[start:end].strip())
+        start = end
+    return [c for c in chunks if c]
+
+
+async def main() -> None:
+    setup_logging()
+    settings = Settings.load()
+    bot = NewsBot(settings)
+    await bot.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

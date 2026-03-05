@@ -1,0 +1,10 @@
+services:
+  news-bot:
+    build: .
+    image: ghcr.io/your-user/telegram-news-summarizer:latest
+    container_name: telegram-news-summarizer
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./news_data:/news_data
