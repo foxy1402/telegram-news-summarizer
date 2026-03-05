@@ -13,28 +13,43 @@ This repo now includes [`.github/workflows/ghcr.yml`](.github/workflows/ghcr.yml
 
 Behavior:
 - On every push to `main`, GitHub Actions builds and pushes:
-  - `ghcr.io/<your_github_username>/telegram-news-summarizer:latest`
-  - `ghcr.io/<your_github_username>/telegram-news-summarizer:sha-<shortsha>`
+  - `ghcr.io/foxy1402/telegram-news-summarizer:latest`
+  - `ghcr.io/foxy1402/telegram-news-summarizer:sha-<shortsha>`
+- Multi-arch is published: `linux/amd64` and `linux/arm64`.
 
 You do not need to run `docker push` manually after that.
+
+If you saw only `:sha-...` in deploy logs, that usually means your service is pinned to a digest/tag from a previous deploy. Set image explicitly to `:latest` and redeploy.
 
 ## Deploy using latest image
 
 Use this image in your platform/service:
-- `ghcr.io/<your_github_username>/telegram-news-summarizer:latest`
+- `ghcr.io/foxy1402/telegram-news-summarizer:latest`
 
 Minimal compose example:
 
 ```yaml
 services:
   news-bot:
-    image: ghcr.io/<your_github_username>/telegram-news-summarizer:latest
+    image: ghcr.io/foxy1402/telegram-news-summarizer:latest
     restart: unless-stopped
     env_file:
       - .env
     volumes:
       - ./news_data:/news_data
 ```
+
+## Generate TELEGRAM_USER_SESSION_STRING (Python 3.14-safe)
+
+Run this command in terminal:
+
+```bash
+python -c "import asyncio; asyncio.set_event_loop(asyncio.new_event_loop()); from pyrogram import Client; api_id=int(input('TELEGRAM_API_ID: ').strip()); api_hash=input('TELEGRAM_API_HASH: ').strip(); app=Client('session_maker', api_id=api_id, api_hash=api_hash); app.start(); print('\nTELEGRAM_USER_SESSION_STRING=' + app.export_session_string()); app.stop()"
+```
+
+After it prints your session string, remove local temporary session files if created:
+- `session_maker.session`
+- `session_maker.session-journal`
 
 ## Required env vars
 
