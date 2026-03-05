@@ -113,6 +113,9 @@ Optional tuning:
 - `SUMMARY_MAX_ITEMS` default `80`
 - `SUMMARY_MAX_CHARS_PER_ITEM` default `700`
 - `RETENTION_DAYS` default `1`
+- `LLM_TIMEOUT_SECONDS` default `120`
+- `LLM_RETRY_BASE_SECONDS` default `2`
+- `LLM_RETRY_MAX_SECONDS` default `120`
 - `DATA_DIR` default `/news_data`
 
 ## 4) Persistent Storage and Mount Path
@@ -189,6 +192,7 @@ DATA_DIR=/your/container/mount/path
   - rank highest-priority items only
   - compress into 2-4 categories (target 3)
   - keep final report to about 5-10 items total
+  - if LLM endpoint times out / returns 429 / returns 5xx, retry with exponential backoff until success
   - send summary to `TARGET_CHAT_ID`
   - cleanup data older than 1 day
 
@@ -231,6 +235,9 @@ SUMMARY_ITEM_WORD_LIMIT=35
 SUMMARY_MAX_ITEMS=80
 SUMMARY_MAX_CHARS_PER_ITEM=700
 RETENTION_DAYS=1
+LLM_TIMEOUT_SECONDS=120
+LLM_RETRY_BASE_SECONDS=2
+LLM_RETRY_MAX_SECONDS=120
 DATA_DIR=/news_data
 LOG_LEVEL=INFO
 ```

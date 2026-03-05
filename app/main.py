@@ -51,6 +51,9 @@ class Settings:
     summary_max_chars_per_item: int
     summary_send_time_utc: str
     retention_days: int
+    llm_timeout_seconds: int
+    llm_retry_base_seconds: int
+    llm_retry_max_seconds: int
     data_dir: Path
 
     @staticmethod
@@ -81,6 +84,9 @@ class Settings:
             summary_max_chars_per_item=int(os.getenv("SUMMARY_MAX_CHARS_PER_ITEM", "700")),
             summary_send_time_utc=os.getenv("SUMMARY_SEND_TIME_UTC", "00:10"),
             retention_days=int(os.getenv("RETENTION_DAYS", "1")),
+            llm_timeout_seconds=int(os.getenv("LLM_TIMEOUT_SECONDS", "120")),
+            llm_retry_base_seconds=int(os.getenv("LLM_RETRY_BASE_SECONDS", "2")),
+            llm_retry_max_seconds=int(os.getenv("LLM_RETRY_MAX_SECONDS", "120")),
             data_dir=data_dir,
         )
 
@@ -193,6 +199,49 @@ class Summarizer:
     def __init__(self, settings: Settings):
         self.settings = settings
 
+    async def _post_with_retry(self, payload: dict) -> dict:
+        url = f"{self.settings.openai_base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.settings.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                async with httpx.AsyncClient(timeout=float(self.settings.llm_timeout_seconds)) as client:
+                    resp = await client.post(url, headers=headers, json=payload)
+
+                if resp.status_code == 429 or 500 <= resp.status_code <= 599:
+                    raise httpx.HTTPStatusError(
+                        f"Retryable status code: {resp.status_code}",
+                        request=resp.request,
+                        response=resp,
+                    )
+
+                resp.raise_for_status()
+                return resp.json()
+            except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError) as e:
+                status_code = None
+                if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                    status_code = e.response.status_code
+                    if 400 <= status_code < 500 and status_code != 429:
+                        raise
+
+                delay = min(
+                    self.settings.llm_retry_max_seconds,
+                    self.settings.llm_retry_base_seconds * (2 ** (attempt - 1)),
+                )
+                logging.warning(
+                    "LLM call failed (attempt=%s, status=%s, error=%s). Retrying in %ss",
+                    attempt,
+                    status_code,
+                    str(e),
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
     def _build_prompt(self, rows: List[sqlite3.Row], day_utc: date) -> str:
         items = []
         for idx, row in enumerate(rows, start=1):
@@ -239,11 +288,6 @@ class Summarizer:
             )
 
         prompt = self._build_prompt(rows, day_utc)
-        url = f"{self.settings.openai_base_url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.settings.openai_api_key}",
-            "Content-Type": "application/json",
-        }
         payload = {
             "model": self.settings.openai_model,
             "temperature": 0.2,
@@ -253,11 +297,7 @@ class Summarizer:
                 {"role": "user", "content": prompt},
             ],
         }
-
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        data = await self._post_with_retry(payload)
 
         content = data["choices"][0]["message"]["content"]
 
