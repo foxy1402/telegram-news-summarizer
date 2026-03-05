@@ -26,6 +26,11 @@ If you saw only `:sha-...` in deploy logs, that usually means your service is pi
 Use this image in your platform/service:
 - `ghcr.io/foxy1402/telegram-news-summarizer:latest`
 
+Important persistent storage step:
+- Create a persistent volume/disk and set mount path to `/news_data`.
+- Keep env var `DATA_DIR=/news_data`.
+- If you choose another mount path, set `DATA_DIR` to exactly the same path.
+
 Minimal compose example:
 
 ```yaml
