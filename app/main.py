@@ -43,6 +43,7 @@ class Settings:
     openai_base_url: str
     openai_api_key: str
     openai_model: str
+    report_language: str
     summary_min_items: int
     summary_max_items_in_report: int
     summary_category_count: int
@@ -76,6 +77,7 @@ class Settings:
             openai_base_url=env_required("OPENAI_BASE_URL").rstrip("/"),
             openai_api_key=env_required("OPENAI_API_KEY"),
             openai_model=env_required("OPENAI_MODEL"),
+            report_language=os.getenv("REPORT_LANGUAGE", "English").strip() or "English",
             summary_min_items=int(os.getenv("SUMMARY_MIN_ITEMS", "5")),
             summary_max_items_in_report=int(os.getenv("SUMMARY_MAX_ITEMS_IN_REPORT", "10")),
             summary_category_count=int(os.getenv("SUMMARY_CATEGORY_COUNT", "3")),
@@ -274,6 +276,7 @@ class Summarizer:
             f"Use 2 to 4 categories (target: {self.settings.summary_category_count}).\n"
             f"Maximum {self.settings.summary_item_word_limit} words for each item summary.\n"
             "Each why_important must be one short sentence.\n"
+            f"Write headline, quick_take, categories, and all item texts in {self.settings.report_language}.\n"
             "Focus on globally/materially important developments, avoid duplicates, and ignore low-signal chatter.\n"
             f"Day (UTC): {day_utc.isoformat()}\n"
             "Posts:\n"
