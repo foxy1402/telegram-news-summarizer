@@ -64,7 +64,8 @@ TELEGRAM_API_ID=
 TELEGRAM_API_HASH=
 TELEGRAM_USER_SESSION_STRING=
 TELEGRAM_BOT_TOKEN=
-TARGET_CHAT_ID=
+TARGET_CHAT_IDS=123456789,-1001234567890
+MODE_CHANGER_ID=123456789
 CHANNEL_USERNAMES=cnn,bbcnews,reuters
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_API_KEY=
@@ -86,6 +87,7 @@ SUMMARY_MAX_CHARS_PER_ITEM=700
 OVERALL_CHUNK_SIZE=120
 OVERALL_MAX_CHARS_PER_ITEM=500
 MODE_BOTH_DELAY_SECONDS=60
+BACKFILL_PER_CHANNEL_LIMIT=500
 RETENTION_DAYS=1
 ```
 
@@ -93,11 +95,16 @@ RETENTION_DAYS=1
 
 Default mode is `top_news`.
 
-Send commands in your `TARGET_CHAT_ID` chat:
+Only `MODE_CHANGER_ID` user can change mode:
 - `/mode` -> show current mode
 - `/mode top_news` -> ranked top-priority items only
 - `/mode overall_summary` -> overall condensed day summary using all stored posts for yesterday
 - `/mode both` -> send `top_news`, wait `MODE_BOTH_DELAY_SECONDS`, then send `overall_summary`
+
+Notes:
+- Reports are delivered to all chat IDs in `TARGET_CHAT_IDS` (comma separated).
+- Backward compatibility: if `TARGET_CHAT_IDS` is empty, bot falls back to single `TARGET_CHAT_ID`.
+- If `MODE_CHANGER_ID` is empty, `/mode` command is disabled.
 
 ## Reliability controls
 
@@ -135,5 +142,5 @@ The bot will ingest mixed-language source posts and ask LLM to output the final 
 ## Where you read the report
 
 You read it on your main account in:
-- DM with your bot (if `TARGET_CHAT_ID` is your user chat id), or
-- your chosen group (if `TARGET_CHAT_ID` is that group id).
+- DM with your bot (if your user ID is included in `TARGET_CHAT_IDS`), or
+- your chosen group (if that group ID is included in `TARGET_CHAT_IDS`).

@@ -8,7 +8,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -43,7 +43,8 @@ class Settings:
     api_hash: str
     user_session_string: str
     sender_bot_token: str
-    target_chat_id: int
+    target_chat_ids: List[int]
+    mode_changer_id: Optional[int]
     channel_usernames: List[str]
     openai_base_url: str
     openai_api_key: str
@@ -58,6 +59,7 @@ class Settings:
     overall_chunk_size: int
     overall_max_chars_per_item: int
     mode_both_delay_seconds: int
+    backfill_per_channel_limit: int
     summary_send_time_utc: str
     retention_days: int
     llm_timeout_seconds: int
@@ -79,12 +81,18 @@ class Settings:
         data_dir = Path(os.getenv("DATA_DIR", "/news_data")).resolve()
         data_dir.mkdir(parents=True, exist_ok=True)
 
+        target_chat_ids_raw = os.getenv("TARGET_CHAT_IDS", "").strip()
+        if not target_chat_ids_raw:
+            target_chat_ids_raw = env_required("TARGET_CHAT_ID")
+        target_chat_ids = parse_int_list(target_chat_ids_raw, "TARGET_CHAT_IDS/TARGET_CHAT_ID")
+
         settings = Settings(
             api_id=int(env_required("TELEGRAM_API_ID")),
             api_hash=env_required("TELEGRAM_API_HASH"),
             user_session_string=env_required("TELEGRAM_USER_SESSION_STRING"),
             sender_bot_token=env_required("TELEGRAM_BOT_TOKEN"),
-            target_chat_id=int(env_required("TARGET_CHAT_ID")),
+            target_chat_ids=target_chat_ids,
+            mode_changer_id=parse_optional_int(os.getenv("MODE_CHANGER_ID", "").strip(), "MODE_CHANGER_ID"),
             channel_usernames=channel_usernames,
             openai_base_url=env_required("OPENAI_BASE_URL").rstrip("/"),
             openai_api_key=env_required("OPENAI_API_KEY"),
@@ -99,6 +107,7 @@ class Settings:
             overall_chunk_size=int(os.getenv("OVERALL_CHUNK_SIZE", "120")),
             overall_max_chars_per_item=int(os.getenv("OVERALL_MAX_CHARS_PER_ITEM", "500")),
             mode_both_delay_seconds=int(os.getenv("MODE_BOTH_DELAY_SECONDS", "60")),
+            backfill_per_channel_limit=int(os.getenv("BACKFILL_PER_CHANNEL_LIMIT", "500")),
             summary_send_time_utc=os.getenv("SUMMARY_SEND_TIME_UTC", "00:10"),
             retention_days=int(os.getenv("RETENTION_DAYS", "1")),
             llm_timeout_seconds=int(os.getenv("LLM_TIMEOUT_SECONDS", "120")),
@@ -114,6 +123,8 @@ class Settings:
         return settings
 
     def validate(self) -> None:
+        if not self.target_chat_ids:
+            raise RuntimeError("TARGET_CHAT_IDS/TARGET_CHAT_ID must include at least one chat id")
         if self.summary_min_items < 1:
             raise RuntimeError("SUMMARY_MIN_ITEMS must be >= 1")
         if self.summary_max_items_in_report < 1:
@@ -134,6 +145,8 @@ class Settings:
             raise RuntimeError("OVERALL_MAX_CHARS_PER_ITEM must be >= 1")
         if self.mode_both_delay_seconds < 0:
             raise RuntimeError("MODE_BOTH_DELAY_SECONDS must be >= 0")
+        if self.backfill_per_channel_limit < 1:
+            raise RuntimeError("BACKFILL_PER_CHANNEL_LIMIT must be >= 1")
         if self.retention_days < 1:
             raise RuntimeError("RETENTION_DAYS must be >= 1")
         if self.llm_timeout_seconds < 1:
@@ -579,8 +592,9 @@ class NewsBot:
     def _is_tracked(self, msg: Message) -> bool:
         return bool(msg.chat and msg.chat.id in self._channel_chat_ids)
 
-    async def backfill_recent(self, days: int = 1, per_channel_limit: int = 500) -> None:
+    async def backfill_recent(self, days: int = 1) -> None:
         since = datetime.now(timezone.utc) - timedelta(days=days)
+        per_channel_limit = self.settings.backfill_per_channel_limit
         for username in self.settings.channel_usernames:
             ch = username if username.startswith("@") else f"@{username}"
             count = 0
@@ -623,7 +637,9 @@ class NewsBot:
                 except Exception:
                     logging.exception("Failed to create top_news summary for %s; using fallback", day_utc)
                     top_summary = self._fallback_summary(top_rows, day_utc, MODE_TOP_NEWS)
-                await self._send_report(top_summary, day_utc)
+                top_failures = await self._send_report(top_summary, day_utc)
+                if len(top_failures) == len(self.settings.target_chat_ids):
+                    raise RuntimeError("top_news delivery failed for all recipients")
 
             if mode == MODE_BOTH and self.settings.mode_both_delay_seconds > 0:
                 logging.info(
@@ -639,7 +655,9 @@ class NewsBot:
                 except Exception:
                     logging.exception("Failed to create overall_summary for %s; using fallback", day_utc)
                     overall_summary = self._fallback_summary(all_rows, day_utc, MODE_OVERALL_SUMMARY)
-                await self._send_report(overall_summary, day_utc)
+                overall_failures = await self._send_report(overall_summary, day_utc)
+                if len(overall_failures) == len(self.settings.target_chat_ids):
+                    raise RuntimeError("overall_summary delivery failed for all recipients")
         except Exception as e:
             send_error = e
             logging.exception("Daily summary run encountered send/generation error for %s", day_utc)
@@ -649,23 +667,29 @@ class NewsBot:
         if send_error is not None:
             raise send_error
 
-    async def _send_report(self, text: str, day_utc: date) -> None:
-        for chunk in split_telegram_text(text):
-            try:
-                await self._send_chunk_with_retry(chunk)
-            except Exception:
-                logging.exception("Failed sending summary chunk for %s", day_utc)
-                raise
+    async def _send_report(self, text: str, day_utc: date) -> List[int]:
+        failed_chat_ids: List[int] = []
+        for chat_id in self.settings.target_chat_ids:
+            for chunk in split_telegram_text(text):
+                try:
+                    await self._send_chunk_with_retry(chat_id, chunk)
+                except Exception:
+                    logging.exception("Failed sending summary chunk for %s to chat_id=%s", day_utc, chat_id)
+                    failed_chat_ids.append(chat_id)
+                    break
+        if failed_chat_ids:
+            logging.warning("Report delivery partial failures for %s: %s", day_utc, failed_chat_ids)
+        return failed_chat_ids
 
-    async def _send_chunk_with_retry(self, text: str) -> None:
+    async def _send_chunk_with_retry(self, chat_id: int, text: str) -> None:
         attempt = 0
         while True:
             attempt += 1
             try:
-                await self.sender_client.send_message(chat_id=self.settings.target_chat_id, text=text)
+                await self.sender_client.send_message(chat_id=chat_id, text=text)
                 return
             except FloodWait as e:
-                logging.warning("Telegram FloodWait while sending summary. Sleeping %s sec", e.value)
+                logging.warning("Telegram FloodWait while sending to %s. Sleeping %s sec", chat_id, e.value)
                 await asyncio.sleep(e.value)
             except RPCError:
                 # Most RPC errors are permanent (e.g., chat not found / bot blocked).
@@ -676,7 +700,8 @@ class NewsBot:
                     self.settings.telegram_send_retry_base_seconds * (2 ** (attempt - 1)),
                 )
                 logging.warning(
-                    "Telegram send failed (attempt=%s, error=%s). Retrying in %ss",
+                    "Telegram send failed (chat_id=%s, attempt=%s, error=%s). Retrying in %ss",
+                    chat_id,
                     attempt,
                     str(e),
                     delay,
@@ -723,9 +748,10 @@ class NewsBot:
         current_mode = self.storage.get_mode()
 
         logging.info(
-            "Bot started. Daily summary schedule: %s UTC. Tracking %s channels. Current mode=%s",
+            "Bot started. Daily summary schedule: %s UTC. Tracking %s channels. Recipients=%s. Current mode=%s",
             self.settings.summary_send_time_utc,
             len(self._channel_chat_ids),
+            len(self.settings.target_chat_ids),
             current_mode,
         )
 
@@ -738,11 +764,16 @@ class NewsBot:
             self.scheduler.shutdown(wait=False)
 
     async def on_mode_command(self, msg: Message) -> None:
-        if not msg.text or not msg.chat:
+        if not msg.text:
             return
 
-        if msg.chat.id != self.settings.target_chat_id:
-            await msg.reply_text("Unauthorized chat for mode changes.")
+        if self.settings.mode_changer_id is None:
+            await msg.reply_text("MODE_CHANGER_ID is not configured. Mode change command is disabled.")
+            return
+
+        actor_id = msg.from_user.id if msg.from_user else None
+        if actor_id != self.settings.mode_changer_id:
+            await msg.reply_text("Unauthorized user for mode changes.")
             return
 
         tokens = msg.text.strip().split()
@@ -767,6 +798,30 @@ class NewsBot:
             f"Mode updated to: {requested}\n"
             "This will be applied on the next scheduled summary run."
         )
+
+
+def parse_int_list(raw: str, name: str) -> List[int]:
+    values = []
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        try:
+            values.append(int(item))
+        except ValueError as e:
+            raise RuntimeError(f"{name} contains non-integer value: {item}") from e
+    if not values:
+        raise RuntimeError(f"{name} must include at least one integer")
+    return values
+
+
+def parse_optional_int(raw: str, name: str) -> Optional[int]:
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"{name} contains non-integer value: {raw}") from e
 
 
 def parse_hh_mm(value: str) -> tuple[int, int]:
