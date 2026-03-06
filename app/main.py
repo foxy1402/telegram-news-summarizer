@@ -12,9 +12,14 @@ from typing import List
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from pyrogram import Client
+from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError
 from pyrogram.types import Message
+
+MODE_TOP_NEWS = "top_news"
+MODE_OVERALL_SUMMARY = "overall_summary"
+MODE_BOTH = "both"
+VALID_MODES = {MODE_TOP_NEWS, MODE_OVERALL_SUMMARY, MODE_BOTH}
 
 
 def setup_logging() -> None:
@@ -50,6 +55,9 @@ class Settings:
     summary_item_word_limit: int
     summary_max_items: int
     summary_max_chars_per_item: int
+    overall_chunk_size: int
+    overall_max_chars_per_item: int
+    mode_both_delay_seconds: int
     summary_send_time_utc: str
     retention_days: int
     llm_timeout_seconds: int
@@ -88,6 +96,9 @@ class Settings:
             summary_item_word_limit=int(os.getenv("SUMMARY_ITEM_WORD_LIMIT", "35")),
             summary_max_items=int(os.getenv("SUMMARY_MAX_ITEMS", "80")),
             summary_max_chars_per_item=int(os.getenv("SUMMARY_MAX_CHARS_PER_ITEM", "700")),
+            overall_chunk_size=int(os.getenv("OVERALL_CHUNK_SIZE", "120")),
+            overall_max_chars_per_item=int(os.getenv("OVERALL_MAX_CHARS_PER_ITEM", "500")),
+            mode_both_delay_seconds=int(os.getenv("MODE_BOTH_DELAY_SECONDS", "60")),
             summary_send_time_utc=os.getenv("SUMMARY_SEND_TIME_UTC", "00:10"),
             retention_days=int(os.getenv("RETENTION_DAYS", "1")),
             llm_timeout_seconds=int(os.getenv("LLM_TIMEOUT_SECONDS", "120")),
@@ -117,6 +128,12 @@ class Settings:
             raise RuntimeError("SUMMARY_MAX_ITEMS must be >= 1")
         if self.summary_max_chars_per_item < 1:
             raise RuntimeError("SUMMARY_MAX_CHARS_PER_ITEM must be >= 1")
+        if self.overall_chunk_size < 1:
+            raise RuntimeError("OVERALL_CHUNK_SIZE must be >= 1")
+        if self.overall_max_chars_per_item < 1:
+            raise RuntimeError("OVERALL_MAX_CHARS_PER_ITEM must be >= 1")
+        if self.mode_both_delay_seconds < 0:
+            raise RuntimeError("MODE_BOTH_DELAY_SECONDS must be >= 0")
         if self.retention_days < 1:
             raise RuntimeError("RETENTION_DAYS must be >= 1")
         if self.llm_timeout_seconds < 1:
@@ -162,6 +179,14 @@ class NewsStorage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_date_utc
                 ON messages(date_utc)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
                 """
             )
             conn.commit()
@@ -210,6 +235,43 @@ class NewsStorage:
                 (start.isoformat(), end.isoformat(), max_items),
             ).fetchall()
             return rows
+
+    def get_messages_for_day_all(self, day_utc: date) -> List[sqlite3.Row]:
+        start = datetime(day_utc.year, day_utc.month, day_utc.day, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT channel_username, chat_id, message_id, date_utc, text
+                FROM messages
+                WHERE date_utc >= ? AND date_utc < ?
+                ORDER BY date_utc ASC
+                """,
+                (start.isoformat(), end.isoformat()),
+            ).fetchall()
+            return rows
+
+    def get_mode(self) -> str:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT value FROM bot_state WHERE key = 'mode'").fetchone()
+            if not row:
+                return MODE_TOP_NEWS
+            value = str(row["value"]).strip().lower()
+            return value if value in VALID_MODES else MODE_TOP_NEWS
+
+    def set_mode(self, mode: str) -> None:
+        mode = mode.strip().lower()
+        if mode not in VALID_MODES:
+            raise RuntimeError(f"Invalid mode: {mode}")
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO bot_state (key, value) VALUES ('mode', ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (mode,),
+            )
+            conn.commit()
 
     def cleanup_old(self, retention_days: int) -> int:
         cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
@@ -313,7 +375,7 @@ class Summarizer:
 
         raise RuntimeError("LLM response content format unsupported")
 
-    def _build_prompt(self, rows: List[sqlite3.Row], day_utc: date) -> str:
+    def _build_top_news_prompt(self, rows: List[sqlite3.Row], day_utc: date) -> str:
         items = []
         for idx, row in enumerate(rows, start=1):
             text = re.sub(r"\s+", " ", row["text"]).strip()
@@ -352,14 +414,14 @@ class Summarizer:
             f"{joined}"
         )
 
-    async def summarize(self, rows: List[sqlite3.Row], day_utc: date) -> str:
+    async def summarize_top_news(self, rows: List[sqlite3.Row], day_utc: date) -> str:
         if not rows:
             return (
                 f"Daily News Summary for {day_utc.isoformat()} (UTC)\n\n"
                 "No messages collected from configured channels for yesterday."
             )
 
-        prompt = self._build_prompt(rows, day_utc)
+        prompt = self._build_top_news_prompt(rows, day_utc)
         payload = {
             "model": self.settings.openai_model,
             "temperature": 0.2,
@@ -413,6 +475,73 @@ class Summarizer:
                 break
 
         return "\n".join(lines).strip()
+
+    async def summarize_overall(self, rows: List[sqlite3.Row], day_utc: date) -> str:
+        if not rows:
+            return (
+                f"Overall News Summary for {day_utc.isoformat()} (UTC)\n\n"
+                "No messages collected from configured channels for yesterday."
+            )
+
+        chunk_summaries: List[str] = []
+        chunk_size = self.settings.overall_chunk_size
+        for start in range(0, len(rows), chunk_size):
+            chunk = rows[start : start + chunk_size]
+            chunk_items = []
+            for i, row in enumerate(chunk, start=1):
+                text = re.sub(r"\s+", " ", row["text"]).strip()
+                text = text[: self.settings.overall_max_chars_per_item]
+                chunk_items.append(
+                    f"[{i}] channel=@{row['channel_username']} time={row['date_utc']} text={text}"
+                )
+            chunk_prompt = (
+                "Summarize this subset of one-day Telegram news posts.\n"
+                f"Write in {self.settings.report_language}.\n"
+                "Return concise plain text with:\n"
+                "1) 3-6 key developments\n"
+                "2) short market tone sentence\n"
+                "3) major risks/watch items\n\n"
+                "Posts:\n"
+                + "\n".join(chunk_items)
+            )
+            payload = {
+                "model": self.settings.openai_model,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": "Be concise and factual."},
+                    {"role": "user", "content": chunk_prompt},
+                ],
+            }
+            data = await self._post_with_retry(payload)
+            chunk_text = self._extract_content(data).strip()
+            if chunk_text:
+                chunk_summaries.append(chunk_text[:2000])
+
+        final_prompt = (
+            "You are preparing a morning digest.\n"
+            f"Language: {self.settings.report_language}\n"
+            f"Day (UTC): {day_utc.isoformat()}\n"
+            "Given partial summaries from the full day, produce a concise overall summary.\n"
+            "Format as plain text:\n"
+            "- One headline line\n"
+            "- One quick-take paragraph\n"
+            "- 6-10 bullets of the most important developments\n"
+            "- One short 'What to watch today' section (3 bullets)\n"
+            "Avoid repetition.\n\n"
+            "Partial summaries:\n"
+            + "\n\n---\n\n".join(chunk_summaries)
+        )
+        final_payload = {
+            "model": self.settings.openai_model,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": "Return concise plain text only."},
+                {"role": "user", "content": final_prompt},
+            ],
+        }
+        final_data = await self._post_with_retry(final_payload)
+        final_text = self._extract_content(final_data).strip()
+        return f"Overall News Summary for {day_utc.isoformat()} (UTC)\n\n{final_text}"
 
 
 class NewsBot:
@@ -482,26 +611,51 @@ class NewsBot:
 
     async def send_daily_summary(self) -> None:
         day_utc = (datetime.now(timezone.utc) - timedelta(days=1)).date()
-        rows = self.storage.get_messages_for_day(day_utc, self.settings.summary_max_items)
+        mode = self.storage.get_mode()
         send_error: Exception | None = None
-        try:
-            summary = await self.summarizer.summarize(rows, day_utc)
-        except Exception:
-            logging.exception("Failed to create LLM summary for %s; using fallback summary", day_utc)
-            summary = self._fallback_summary(rows, day_utc)
+        logging.info("Running daily summary for %s in mode=%s", day_utc, mode)
 
-        for chunk in split_telegram_text(summary):
-            try:
-                await self._send_chunk_with_retry(chunk)
-            except Exception as e:
-                send_error = e
-                logging.exception("Failed sending summary chunk for %s", day_utc)
-                break
+        try:
+            if mode in (MODE_TOP_NEWS, MODE_BOTH):
+                top_rows = self.storage.get_messages_for_day(day_utc, self.settings.summary_max_items)
+                try:
+                    top_summary = await self.summarizer.summarize_top_news(top_rows, day_utc)
+                except Exception:
+                    logging.exception("Failed to create top_news summary for %s; using fallback", day_utc)
+                    top_summary = self._fallback_summary(top_rows, day_utc, MODE_TOP_NEWS)
+                await self._send_report(top_summary, day_utc)
+
+            if mode == MODE_BOTH and self.settings.mode_both_delay_seconds > 0:
+                logging.info(
+                    "Mode both: waiting %s seconds before overall_summary",
+                    self.settings.mode_both_delay_seconds,
+                )
+                await asyncio.sleep(self.settings.mode_both_delay_seconds)
+
+            if mode in (MODE_OVERALL_SUMMARY, MODE_BOTH):
+                all_rows = self.storage.get_messages_for_day_all(day_utc)
+                try:
+                    overall_summary = await self.summarizer.summarize_overall(all_rows, day_utc)
+                except Exception:
+                    logging.exception("Failed to create overall_summary for %s; using fallback", day_utc)
+                    overall_summary = self._fallback_summary(all_rows, day_utc, MODE_OVERALL_SUMMARY)
+                await self._send_report(overall_summary, day_utc)
+        except Exception as e:
+            send_error = e
+            logging.exception("Daily summary run encountered send/generation error for %s", day_utc)
 
         deleted = self.storage.cleanup_old(self.settings.retention_days)
         logging.info("Summary run for %s finished. Cleanup removed %s old rows", day_utc, deleted)
         if send_error is not None:
             raise send_error
+
+    async def _send_report(self, text: str, day_utc: date) -> None:
+        for chunk in split_telegram_text(text):
+            try:
+                await self._send_chunk_with_retry(chunk)
+            except Exception:
+                logging.exception("Failed sending summary chunk for %s", day_utc)
+                raise
 
     async def _send_chunk_with_retry(self, text: str) -> None:
         attempt = 0
@@ -533,8 +687,9 @@ class NewsBot:
                     ) from e
                 await asyncio.sleep(delay)
 
-    def _fallback_summary(self, rows: List[sqlite3.Row], day_utc: date) -> str:
-        lines = [f"Daily News Summary for {day_utc.isoformat()} (UTC)", ""]
+    def _fallback_summary(self, rows: List[sqlite3.Row], day_utc: date, mode: str) -> str:
+        prefix = "Overall News Summary" if mode == MODE_OVERALL_SUMMARY else "Daily News Summary"
+        lines = [f"{prefix} for {day_utc.isoformat()} (UTC)", ""]
         if not rows:
             lines.append("No messages collected from configured channels for yesterday.")
             return "\n".join(lines)
@@ -552,6 +707,10 @@ class NewsBot:
         async def _handler(client: Client, msg: Message) -> None:
             await self.on_new_message(client, msg)
 
+        @self.sender_client.on_message(filters.command("mode"))
+        async def _mode_handler(_client: Client, msg: Message) -> None:
+            await self.on_mode_command(msg)
+
         await self.ingest_client.start()
         await self.sender_client.start()
 
@@ -561,11 +720,13 @@ class NewsBot:
         hh, mm = parse_hh_mm(self.settings.summary_send_time_utc)
         self.scheduler.add_job(self.send_daily_summary, "cron", hour=hh, minute=mm)
         self.scheduler.start()
+        current_mode = self.storage.get_mode()
 
         logging.info(
-            "Bot started. Daily summary schedule: %s UTC. Tracking %s channels.",
+            "Bot started. Daily summary schedule: %s UTC. Tracking %s channels. Current mode=%s",
             self.settings.summary_send_time_utc,
             len(self._channel_chat_ids),
+            current_mode,
         )
 
         stop_event = asyncio.Event()
@@ -575,6 +736,37 @@ class NewsBot:
             await self.ingest_client.stop()
             await self.sender_client.stop()
             self.scheduler.shutdown(wait=False)
+
+    async def on_mode_command(self, msg: Message) -> None:
+        if not msg.text or not msg.chat:
+            return
+
+        if msg.chat.id != self.settings.target_chat_id:
+            await msg.reply_text("Unauthorized chat for mode changes.")
+            return
+
+        tokens = msg.text.strip().split()
+        current_mode = self.storage.get_mode()
+        if len(tokens) == 1:
+            await msg.reply_text(
+                f"Current mode: {current_mode}\n"
+                "Usage: /mode top_news | /mode overall_summary | /mode both"
+            )
+            return
+
+        requested = tokens[1].strip().lower()
+        if requested not in VALID_MODES:
+            await msg.reply_text(
+                "Invalid mode.\n"
+                "Valid modes: top_news, overall_summary, both"
+            )
+            return
+
+        self.storage.set_mode(requested)
+        await msg.reply_text(
+            f"Mode updated to: {requested}\n"
+            "This will be applied on the next scheduled summary run."
+        )
 
 
 def parse_hh_mm(value: str) -> tuple[int, int]:

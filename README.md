@@ -6,6 +6,7 @@ One report per day.
 - Ranks only highest-priority news with LLM.
 - Sends concise morning report via bot token to your main account/chat.
 - Keeps local DB for 1 day only.
+- Supports report modes controlled by Telegram command `/mode`.
 
 ## Auto GHCR publish on push
 
@@ -82,8 +83,21 @@ SUMMARY_CATEGORY_COUNT=3
 SUMMARY_ITEM_WORD_LIMIT=35
 SUMMARY_MAX_ITEMS=80
 SUMMARY_MAX_CHARS_PER_ITEM=700
+OVERALL_CHUNK_SIZE=120
+OVERALL_MAX_CHARS_PER_ITEM=500
+MODE_BOTH_DELAY_SECONDS=60
 RETENTION_DAYS=1
 ```
+
+## Report modes (`/mode`)
+
+Default mode is `top_news`.
+
+Send commands in your `TARGET_CHAT_ID` chat:
+- `/mode` -> show current mode
+- `/mode top_news` -> ranked top-priority items only
+- `/mode overall_summary` -> overall condensed day summary using all stored posts for yesterday
+- `/mode both` -> send `top_news`, wait `MODE_BOTH_DELAY_SECONDS`, then send `overall_summary`
 
 ## Reliability controls
 
