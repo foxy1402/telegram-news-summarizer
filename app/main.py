@@ -629,6 +629,11 @@ class NewsBot:
         send_error: Exception | None = None
         logging.info("Running daily summary for %s in mode=%s", day_utc, mode)
 
+        # Backfill before summarising to catch any messages the live listener may
+        # have missed (e.g. reconnects, restarts).  days=2 ensures we cover all of
+        # yesterday from 00:00 UTC regardless of when the job fires.
+        await self.backfill_recent(days=2)
+
         try:
             if mode in (MODE_TOP_NEWS, MODE_BOTH):
                 top_rows = self.storage.get_messages_for_day(day_utc, self.settings.summary_max_items)
