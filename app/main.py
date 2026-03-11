@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -20,6 +21,11 @@ MODE_TOP_NEWS = "top_news"
 MODE_OVERALL_SUMMARY = "overall_summary"
 MODE_BOTH = "both"
 VALID_MODES = {MODE_TOP_NEWS, MODE_OVERALL_SUMMARY, MODE_BOTH}
+
+
+def _normalize_channel(username: str) -> str:
+    """Return username with a leading '@', adding it if missing."""
+    return username if username.startswith("@") else f"@{username}"
 
 
 def setup_logging() -> None:
@@ -74,7 +80,9 @@ class Settings:
     @staticmethod
     def load() -> "Settings":
         channels_raw = env_required("CHANNEL_USERNAMES")
-        channel_usernames = [c.strip() for c in channels_raw.split(",") if c.strip()]
+        channel_usernames = list(dict.fromkeys(
+            c.strip() for c in channels_raw.split(",") if c.strip()
+        ))
         if not channel_usernames:
             raise RuntimeError("CHANNEL_USERNAMES must include at least one username")
 
@@ -84,7 +92,9 @@ class Settings:
         target_chat_ids_raw = os.getenv("TARGET_CHAT_IDS", "").strip()
         if not target_chat_ids_raw:
             target_chat_ids_raw = env_required("TARGET_CHAT_ID")
-        target_chat_ids = parse_int_list(target_chat_ids_raw, "TARGET_CHAT_IDS/TARGET_CHAT_ID")
+        target_chat_ids = list(dict.fromkeys(
+            parse_int_list(target_chat_ids_raw, "TARGET_CHAT_IDS/TARGET_CHAT_ID")
+        ))
 
         settings = Settings(
             api_id=int(env_required("TELEGRAM_API_ID")),
@@ -174,6 +184,8 @@ class NewsStorage:
 
     def _init_db(self) -> None:
         with closing(self._connect()) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS messages (
@@ -322,48 +334,48 @@ class Summarizer:
         }
 
         attempt = 0
-        while True:
-            attempt += 1
-            try:
-                async with httpx.AsyncClient(timeout=float(self.settings.llm_timeout_seconds)) as client:
+        async with httpx.AsyncClient(timeout=float(self.settings.llm_timeout_seconds)) as client:
+            while True:
+                attempt += 1
+                try:
                     resp = await client.post(url, headers=headers, json=payload)
 
-                if resp.status_code == 429 or 500 <= resp.status_code <= 599:
-                    raise httpx.HTTPStatusError(
-                        f"Retryable status code: {resp.status_code}",
-                        request=resp.request,
-                        response=resp,
+                    if resp.status_code == 429 or 500 <= resp.status_code <= 599:
+                        raise httpx.HTTPStatusError(
+                            f"Retryable status code: {resp.status_code}",
+                            request=resp.request,
+                            response=resp,
+                        )
+
+                    resp.raise_for_status()
+                    return resp.json()
+                except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError) as e:
+                    status_code = None
+                    retry_after = None
+                    if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                        status_code = e.response.status_code
+                        if 400 <= status_code < 500 and status_code != 429:
+                            raise
+                        retry_after = e.response.headers.get("Retry-After")
+
+                    delay = min(
+                        self.settings.llm_retry_max_seconds,
+                        self.settings.llm_retry_base_seconds * (2 ** (attempt - 1)),
                     )
-
-                resp.raise_for_status()
-                return resp.json()
-            except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError) as e:
-                status_code = None
-                retry_after = None
-                if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
-                    status_code = e.response.status_code
-                    if 400 <= status_code < 500 and status_code != 429:
-                        raise
-                    retry_after = e.response.headers.get("Retry-After")
-
-                delay = min(
-                    self.settings.llm_retry_max_seconds,
-                    self.settings.llm_retry_base_seconds * (2 ** (attempt - 1)),
-                )
-                if retry_after and retry_after.isdigit():
-                    delay = max(delay, int(retry_after))
-                logging.warning(
-                    "LLM call failed (attempt=%s, status=%s, error=%s). Retrying in %ss",
-                    attempt,
-                    status_code,
-                    str(e),
-                    delay,
-                )
-                if attempt >= self.settings.llm_retry_max_attempts:
-                    raise RuntimeError(
-                        f"LLM call failed after {attempt} attempts; last_status={status_code}"
-                    ) from e
-                await asyncio.sleep(delay)
+                    if retry_after and retry_after.isdigit():
+                        delay = max(delay, int(retry_after))
+                    logging.warning(
+                        "LLM call failed (attempt=%s, status=%s, error=%s). Retrying in %ss",
+                        attempt,
+                        status_code,
+                        str(e),
+                        delay,
+                    )
+                    if attempt >= self.settings.llm_retry_max_attempts:
+                        raise RuntimeError(
+                            f"LLM call failed after {attempt} attempts; last_status={status_code}"
+                        ) from e
+                    await asyncio.sleep(delay)
 
     @staticmethod
     def _extract_content(data: dict) -> str:
@@ -444,9 +456,12 @@ class Summarizer:
                 {"role": "user", "content": prompt},
             ],
         }
+        del prompt
         data = await self._post_with_retry(payload)
+        del payload
 
         content = self._extract_content(data)
+        del data
         content = content.strip()
         if content.startswith("```"):
             content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.S).strip()
@@ -527,6 +542,7 @@ class Summarizer:
             }
             data = await self._post_with_retry(payload)
             chunk_text = self._extract_content(data).strip()
+            del data
             if chunk_text:
                 chunk_summaries.append(chunk_text[:2000])
 
@@ -544,6 +560,7 @@ class Summarizer:
             "Partial summaries:\n"
             + "\n\n---\n\n".join(chunk_summaries)
         )
+        chunk_summaries.clear()
         final_payload = {
             "model": self.settings.openai_model,
             "temperature": 0.2,
@@ -552,8 +569,10 @@ class Summarizer:
                 {"role": "user", "content": final_prompt},
             ],
         }
+        del final_prompt
         final_data = await self._post_with_retry(final_payload)
         final_text = self._extract_content(final_data).strip()
+        del final_data
         return f"Overall News Summary for {day_utc.isoformat()} (UTC)\n\n{final_text}"
 
 
@@ -577,11 +596,12 @@ class NewsBot:
         self.storage = NewsStorage(settings.data_dir / "news.sqlite3")
         self.summarizer = Summarizer(settings)
         self.scheduler = AsyncIOScheduler(timezone="UTC")
-        self._channel_chat_ids = set()
+        self._channel_chat_ids: set = set()
+        self._summary_lock = asyncio.Lock()
 
     async def bootstrap_channels(self) -> None:
         for username in self.settings.channel_usernames:
-            ch = username if username.startswith("@") else f"@{username}"
+            ch = _normalize_channel(username)
             try:
                 chat = await self.ingest_client.get_chat(ch)
                 self._channel_chat_ids.add(chat.id)
@@ -596,37 +616,57 @@ class NewsBot:
         since = datetime.now(timezone.utc) - timedelta(days=days)
         per_channel_limit = self.settings.backfill_per_channel_limit
         for username in self.settings.channel_usernames:
-            ch = username if username.startswith("@") else f"@{username}"
-            count = 0
-            try:
-                async for msg in self.ingest_client.get_chat_history(ch, limit=per_channel_limit):
-                    msg_time = msg.date.replace(tzinfo=timezone.utc)
-                    if msg_time < since:
-                        break
-                    text = message_to_text(msg)
-                    uname = msg.chat.username or ch.lstrip("@")
-                    self.storage.save_message(uname, msg.chat.id, msg.id, msg_time, text)
-                    count += 1
-                    await asyncio.sleep(0)
-                logging.info("Backfilled %s messages for %s", count, ch)
-            except FloodWait as e:
-                logging.warning("FloodWait during backfill for %s, sleeping %s sec", ch, e.value)
-                await asyncio.sleep(e.value)
-            except Exception:
-                logging.exception("Failed backfill for %s", ch)
+            ch = _normalize_channel(username)
+            for attempt in range(2):
+                count = 0
+                try:
+                    async for msg in self.ingest_client.get_chat_history(ch, limit=per_channel_limit):
+                        msg_time = msg.date.replace(tzinfo=timezone.utc)
+                        if msg_time < since:
+                            break
+                        text = message_to_text(msg)
+                        uname = msg.chat.username or ch.lstrip("@")
+                        self.storage.save_message(uname, msg.chat.id, msg.id, msg_time, text)
+                        count += 1
+                        await asyncio.sleep(0)
+                    logging.info("Backfilled %s messages for %s", count, ch)
+                    break
+                except FloodWait as e:
+                    logging.warning("FloodWait during backfill for %s, sleeping %s sec", ch, e.value)
+                    await asyncio.sleep(e.value)
+                    if attempt == 1:
+                        logging.error("FloodWait persists for %s after retry; channel may be incomplete", ch)
+                except Exception:
+                    logging.exception("Failed backfill for %s", ch)
+                    break
 
     async def on_new_message(self, _client: Client, msg: Message) -> None:
         if not self._is_tracked(msg):
             return
-        text = message_to_text(msg)
-        msg_time = msg.date.replace(tzinfo=timezone.utc)
-        uname = msg.chat.username or str(msg.chat.id)
-        self.storage.save_message(uname, msg.chat.id, msg.id, msg_time, text)
+        try:
+            text = message_to_text(msg)
+            msg_time = msg.date.replace(tzinfo=timezone.utc)
+            uname = msg.chat.username or str(msg.chat.id)
+            self.storage.save_message(uname, msg.chat.id, msg.id, msg_time, text)
+        except Exception:
+            logging.exception(
+                "Failed to store message id=%s from chat %s",
+                msg.id,
+                msg.chat.id if msg.chat else "unknown",
+            )
 
     async def send_daily_summary(self) -> None:
+        if self._summary_lock.locked():
+            logging.warning("Daily summary already running; skipping overlapping invocation")
+            return
+        async with self._summary_lock:
+            await self._run_daily_summary()
+
+    async def _run_daily_summary(self) -> None:
         day_utc = (datetime.now(timezone.utc) - timedelta(days=1)).date()
         mode = self.storage.get_mode()
         send_error: Exception | None = None
+        t0 = datetime.now(timezone.utc)
         logging.info("Running daily summary for %s in mode=%s", day_utc, mode)
 
         # Backfill before summarising to catch any messages the live listener may
@@ -635,14 +675,27 @@ class NewsBot:
         await self.backfill_recent(days=2)
 
         try:
+            # In MODE_BOTH fetch all rows once and slice for top_news to avoid
+            # a second identical DB query a few minutes later.
+            if mode == MODE_BOTH:
+                shared_rows = self.storage.get_messages_for_day_all(day_utc)
+            else:
+                shared_rows = None
+
             if mode in (MODE_TOP_NEWS, MODE_BOTH):
-                top_rows = self.storage.get_messages_for_day(day_utc, self.settings.summary_max_items)
+                top_rows = (
+                    shared_rows[: self.settings.summary_max_items]
+                    if shared_rows is not None
+                    else self.storage.get_messages_for_day(day_utc, self.settings.summary_max_items)
+                )
                 try:
                     top_summary = await self.summarizer.summarize_top_news(top_rows, day_utc)
                 except Exception:
                     logging.exception("Failed to create top_news summary for %s; using fallback", day_utc)
                     top_summary = self._fallback_summary(top_rows, day_utc, MODE_TOP_NEWS)
+                del top_rows
                 top_failures = await self._send_report(top_summary, day_utc)
+                del top_summary
                 if len(top_failures) == len(self.settings.target_chat_ids):
                     raise RuntimeError("top_news delivery failed for all recipients")
 
@@ -654,21 +707,35 @@ class NewsBot:
                 await asyncio.sleep(self.settings.mode_both_delay_seconds)
 
             if mode in (MODE_OVERALL_SUMMARY, MODE_BOTH):
-                all_rows = self.storage.get_messages_for_day_all(day_utc)
+                all_rows = (
+                    shared_rows
+                    if shared_rows is not None
+                    else self.storage.get_messages_for_day_all(day_utc)
+                )
+                shared_rows = None  # transfer ownership; avoid keeping two references
                 try:
                     overall_summary = await self.summarizer.summarize_overall(all_rows, day_utc)
                 except Exception:
                     logging.exception("Failed to create overall_summary for %s; using fallback", day_utc)
                     overall_summary = self._fallback_summary(all_rows, day_utc, MODE_OVERALL_SUMMARY)
+                del all_rows
                 overall_failures = await self._send_report(overall_summary, day_utc)
+                del overall_summary
                 if len(overall_failures) == len(self.settings.target_chat_ids):
                     raise RuntimeError("overall_summary delivery failed for all recipients")
+
+            del shared_rows
         except Exception as e:
             send_error = e
             logging.exception("Daily summary run encountered send/generation error for %s", day_utc)
 
         deleted = self.storage.cleanup_old(self.settings.retention_days)
-        logging.info("Summary run for %s finished. Cleanup removed %s old rows", day_utc, deleted)
+        gc.collect()
+        elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
+        logging.info(
+            "Summary run for %s finished in %.1fs. Cleanup removed %s old rows",
+            day_utc, elapsed, deleted,
+        )
         if send_error is not None:
             raise send_error
 
@@ -748,7 +815,13 @@ class NewsBot:
         await self.backfill_recent(days=1)
 
         hh, mm = parse_hh_mm(self.settings.summary_send_time_utc)
-        self.scheduler.add_job(self.send_daily_summary, "cron", hour=hh, minute=mm)
+        self.scheduler.add_job(
+            self.send_daily_summary,
+            "cron",
+            hour=hh,
+            minute=mm,
+            misfire_grace_time=3600,
+        )
         self.scheduler.start()
         current_mode = self.storage.get_mode()
 
