@@ -434,7 +434,7 @@ class Summarizer:
             f"Maximum {self.settings.summary_item_word_limit} words for each item summary.\n"
             "Each why_important must be one short sentence.\n"
             f"Write headline, quick_take, llm_conclusion_of_the_day, categories, and all item texts in {self.settings.report_language}.\n"
-            "llm_conclusion_of_the_day must be one concise paragraph that synthesizes the full day's context from the provided posts.\n"
+            "llm_conclusion_of_the_day must be one concise paragraph (2-3 sentences max) that synthesizes the full day's context from the provided posts.\n"
             "Focus on globally/materially important developments, avoid duplicates, and ignore low-signal chatter.\n"
             f"Day (UTC): {day_utc.isoformat()}\n"
             "Posts:\n"
@@ -560,7 +560,7 @@ class Summarizer:
             "- One headline line\n"
             "- One quick-take paragraph\n"
             "- 6-10 bullets of the most important developments\n"
-            "- One short 'LLM Conclusion of the Day' section (3 bullets), synthesized from the full day's context\n"
+            "- One short 'LLM Conclusion of the Day' paragraph (2-3 sentences), synthesized from the full day's context\n"
             "Avoid repetition.\n\n"
             "Partial summaries:\n"
             + "\n\n---\n\n".join(chunk_summaries)
