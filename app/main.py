@@ -419,6 +419,7 @@ class Summarizer:
             "{\n"
             "  \"headline\": \"string\",\n"
             "  \"quick_take\": \"string\",\n"
+            "  \"llm_conclusion_of_the_day\": \"string\",\n"
             "  \"categories\": [\n"
             "    {\n"
             "      \"name\": \"string\",\n"
@@ -432,7 +433,8 @@ class Summarizer:
             f"Use 2 to 4 categories (target: {self.settings.summary_category_count}).\n"
             f"Maximum {self.settings.summary_item_word_limit} words for each item summary.\n"
             "Each why_important must be one short sentence.\n"
-            f"Write headline, quick_take, categories, and all item texts in {self.settings.report_language}.\n"
+            f"Write headline, quick_take, llm_conclusion_of_the_day, categories, and all item texts in {self.settings.report_language}.\n"
+            "llm_conclusion_of_the_day must be one concise paragraph that synthesizes the full day's context from the provided posts.\n"
             "Focus on globally/materially important developments, avoid duplicates, and ignore low-signal chatter.\n"
             f"Day (UTC): {day_utc.isoformat()}\n"
             "Posts:\n"
@@ -474,11 +476,14 @@ class Summarizer:
 
         headline = parsed.get("headline", f"Top News {day_utc.isoformat()}")
         quick_take = parsed.get("quick_take", "")
+        llm_conclusion = parsed.get("llm_conclusion_of_the_day", "")
         categories = parsed.get("categories", [])
 
         lines = [f"Daily News Summary for {day_utc.isoformat()} (UTC)", "", f"{headline}"]
         if quick_take:
             lines.extend(["", f"Quick take: {quick_take}"])
+        if llm_conclusion:
+            lines.extend(["", f"LLM Conclusion of the Day: {llm_conclusion}"])
 
         item_counter = 0
         lines.append("")
@@ -555,7 +560,7 @@ class Summarizer:
             "- One headline line\n"
             "- One quick-take paragraph\n"
             "- 6-10 bullets of the most important developments\n"
-            "- One short 'What to watch today' section (3 bullets)\n"
+            "- One short 'LLM Conclusion of the Day' section (3 bullets), synthesized from the full day's context\n"
             "Avoid repetition.\n\n"
             "Partial summaries:\n"
             + "\n\n---\n\n".join(chunk_summaries)
